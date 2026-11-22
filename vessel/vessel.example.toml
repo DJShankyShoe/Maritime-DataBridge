@@ -1,0 +1,43 @@
+# Vessel daemon configuration.
+# Only operator-tunable values live here; architectural decisions are fixed in code.
+# Resolution order: CLI arg → $NOC_VESSEL_CONFIG → /etc/noc/vessel.toml.
+
+[capture]
+interfaces = []                      # REQUIRED: interfaces dumpcap captures on, e.g. ["eth0", "can0"] (list them: ip -br link)
+pipe_path = "/run/noc-vessel/capture.pipe"  # FIFO (RuntimeDirectory when run as a service)
+fifo_buffer_size_kb = 16384           # 16MB; requires host provisioning (fs.pipe-max-size)
+libpcap_buffer_size_mb = 64           # per-interface, passed to dumpcap -B flag; 64 holds ~75 Mbps lossless
+
+[ring_buffer]
+size_mb = 128                         # tuned by experiment: fresh live data + occasional efficient spills
+spill_high_watermark_pct = 95         # at this % full, drain never-sent data to encrypted disk
+
+[chunking]
+chunk_size_kb = 64                    # soft threshold; fills by size down to ~0.26 Mbps input
+max_wait_ms = 2000                    # live chunk closes early if not filled in time
+
+[disk_buffer]
+segment_size_mb = 32                  # outage spill unit (a soft target, so a file can be a bit bigger); whole segments only, remainder kept in RAM; must be < ring_buffer.size_mb (128/32 = 4 segments)
+link_down_timeout_s = 15              # socket timeout to detect link down
+spill_dir = "/var/lib/noc-vessel/spill"  # encrypted outage segments (StateDirectory)
+
+[replay_buffer]
+margin_mb = 5                         # replay buffer size = segment_size_mb + margin_mb (= 37 MB)
+
+[transport]
+max_in_flight_chunks = 8              # W = chunk_size × max_in_flight = 512 KB in flight
+ack_timeout_ms = 2000
+live_replay_send_ratio = 0            # 0 = strict live priority (REPLAY only when no LIVE ready); N>=1 = weighted N:1
+shore_addr = ""                       # REQUIRED: the shore's host:port, e.g. "10.0.0.5:9600", any address this vessel can reach
+
+[identity]
+# This vessel's P-256 signing key, PKCS#8 DER. install.sh fills it in: the WARP device
+# key, staged at every start from /var/lib/cloudflare-warp/reg.json (the device must be on
+# the MASQUE tunnel protocol) to /run/noc-vessel/warp_identity.key.
+key_file = ""
+
+[tpm]
+# TSS transport to the TPM that holds the at-rest KEKs; install.sh sets it. The
+# vessel refuses to start without a TPM, and a production build accepts only a TPM device
+# (device:...), never a software TPM.
+tcti = "device:/dev/tpmrm0"

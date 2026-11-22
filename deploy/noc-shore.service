@@ -1,0 +1,60 @@
+# NOC shore daemon
+# Hardened systemd service unit for the NOC shore daemon.
+# Receives network captures from vessels and forwards them to Malcolm for analysis.
+# Note: systemd does not allow inline comments on directive lines, so every comment is on its own line.
+
+[Unit]
+Description=NOC shore daemon (multi-vessel receive -> Malcolm ingest)
+Documentation=file:///etc/noc/shore.toml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=noc-shore
+Group=noc-shore
+ExecStart=/usr/local/bin/noc-shore
+
+# Automatically restart the daemon after 2 seconds if it stops unexpectedly.
+Restart=always
+RestartSec=2
+
+# Creates /var/lib/noc-shore with 0700 permissions for staging and Malcolm ingest files.
+# Private permissions prevent other unprivileged users on the machine from viewing packet captures.
+StateDirectory=noc-shore
+StateDirectoryMode=0700
+# status.json for noc-console
+RuntimeDirectory=noc-shore
+RuntimeDirectoryMode=0700
+
+# Security hardening: shore only binds a network port and writes files without launching
+# child processes, allowing full systemd privilege restrictions and sandboxing.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/noc-shore
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

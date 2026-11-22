@@ -1,0 +1,25 @@
+# Shore daemon configuration.
+# Resolution order: CLI arg → $NOC_SHORE_CONFIG → /etc/noc/shore.toml.
+
+[shore]
+listen_addr = "0.0.0.0:9600"     # local bind; production shore has no public IP (WARP Connector)
+keepalive_interval_s = 5         # shore→vessel KEEPALIVE cadence (must be < vessel link_down_timeout_s)
+
+[shore.ingest]
+mode = "size"                    # "size" | "time"
+flush_size_mb = 10               # used when mode = "size"
+flush_interval_s = 30            # used when mode = "time", periodic, link-state-agnostic
+downtime_timeout_s = 15          # link-drop detection window (size mode → flush on fire)
+temp_dir = "/var/lib/noc-shore/tmp/"
+ingest_dir = "/var/lib/noc-shore/ingest/"
+
+[shore.identity]
+# Vessel public key (P-256 SPKI) -> vessel_id, looked up in the Cloudflare Zero Trust
+# Devices API: a vessel's WARP device name becomes its vessel_id.
+cloudflare_account_id = ""                       # REQUIRED: the Zero Trust account id (not a secret)
+api_token_file = "/etc/noc/cf_api.token"         # read-only Devices API token, 0400 noc-shore; never inline
+                                                 # (or set NOC_CF_API_TOKEN in the environment)
+vessel_lookup_refresh_s = 600                    # cache refresh, and so the revocation window
+# Offline instead, with no Cloudflare: comment out cloudflare_account_id and list the
+# vessels in a file, one line each: "<base64 P-256 public key>" = "<vessel id>"
+# devices_file = "/etc/noc/devices.toml"

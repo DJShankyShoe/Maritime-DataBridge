@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["common", "vessel", "shore"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "proprietary"
+
+# Shared dependency versions so the vessel and shore daemons stay in lockstep.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Crypto: single whole-file AES-256-GCM envelope encryption.
+aes-gcm = "0.10"
+rand = "0.8"
+hex = "0.4"

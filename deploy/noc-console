@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""noc-console: what the vessel and shore daemons on THIS machine are doing, live.
+
+    sudo noc-console [--verbose]
+
+The panel comes from the daemons' status snapshots (/run/noc-vessel/status.json,
+/run/noc-shore/status.json, rewritten every 250 ms: counters and levels, no keys); the
+per-second activity lines are the difference between snapshots; the events (link,
+spill, segments sealed and replayed, sessions, files published) are the daemons' normal
+log lines, followed in the journal. Whichever of noc-vessel and noc-shore is installed
+here is shown. Root (sudo) is needed to read the snapshots and the journal.
+
+--verbose also shows every other log line the daemons write. Ctrl-C quits.
+Standard library only.
+"""
+import argparse, collections, datetime, json, os, queue, re, shutil, signal, socket, subprocess, sys, threading, time
+
+HOST = socket.gethostname()
+FRAME = 0.1            # seconds between redraws
+SUMMARY = 1.0          # seconds per activity line
+RATE_WINDOW = 3.0      # seconds averaged for the Mbps figures
+STATUS = {"V": "/run/noc-vessel/status.json", "S": "/run/noc-shore/status.json"}
+UNIT = {"V": "noc-vessel", "S": "noc-shore"}
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+LINE = re.compile(r"^(?P<ts>\d{4}-\d\d-\d\dT[\d:.]+Z?)\s+(?P<lvl>[A-Z]+)\s+(?P<tgt>[\w:]+):\s(?P<rest>.*)$")
+TAIL = re.compile(r'\s(\w+)=("(?:[^"\\]|\\.)*"|\S+)$')
+
+def parse(line):
+    """A tracing fmt line -> (level, message, fields), or None. The key=value fields come
+    after the message, so they are peeled off the end."""
+    m = LINE.match(ANSI.sub("", line).rstrip())
+    if not m:
+        return None
+    rest, fields = " " + m.group("rest"), {}
+    while True:
+        t = TAIL.search(rest)
+        if not t:
+            break
+        v = t.group(2)
+        fields[t.group(1)] = v[1:-1].replace('\\"', '"') if v.startswith('"') else v
+        rest = rest[:t.start()]
+    return m.group("lvl"), rest.strip(), fields
+
+def mb(b):
+    b = float(b or 0)
+    return f"{b / 1e6:.1f} MB" if b >= 1e6 else f"{b / 1e3:.1f} KB" if b >= 1e3 else f"{b:.0f} B"
+
+def bar(frac, width=24):
+    n = int(round(max(0.0, min(1.0, frac)) * width))
+    return "█" * n + "░" * (width - n)
+
+def fit(line, cols):
+    """Cut a line to the terminal width (visible characters), so it never wraps."""
+    if len(ANSI.sub("", line)) <= cols:
+        return line
+    out, n = [], 0
+    for tok in re.split(r"(\x1b\[[0-9;]*m)", line):
+        if tok.startswith("\x1b"):
+            out.append(tok)
+            continue
+        take = tok[:max(0, cols - n)]
+        out.append(take); n += len(take)
+        if n >= cols:
+            break
+    return "".join(out) + "\x1b[0m"
+
+def wrap(line, cols, indent=21):
+    if len(ANSI.sub("", line)) <= cols:
+        return [line]
+    out, cur, n, pad = [], "", 0, " " * indent
+    for tok in re.split(r"(\x1b\[[0-9;]*m|\s+)", line):
+        if not tok:
+            continue
+        w = 0 if tok.startswith("\x1b") else len(tok)
+        if n + w > cols and w and not tok.isspace():
+            out.append(cur + "\x1b[0m"); cur, n = pad, len(pad)
+        cur += tok; n += w
+    out.append(cur)
+    return out
+
+def read_status(side):
+    try:
+        with open(STATUS[side]) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+class Console:
+    def __init__(self, verbose, sides):
+        self.verbose, self.sides = verbose, sides
+        self.lines = collections.deque(maxlen=400)
+        self.last_say = {}                       # side -> (text, time, repeats)
+        self.hist = {s: collections.deque(maxlen=80) for s in sides}   # (time, snapshot)
+        self.last_summary = {s: None for s in sides}
+        self.prev_frame, self.prev_size = [], None
+        self.stream_out = not sys.stdout.isatty()
+
+    # ------------------------------------------------------------------ output
+    def say(self, side, text, colour=""):
+        """Add an activity line; the same text again within 10 s just counts up."""
+        now = time.time()
+        prev = self.last_say.get(side)
+        stamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        tag = {"V": "\x1b[36mVESSEL\x1b[0m", "S": "\x1b[35mSHORE \x1b[0m"}[side]
+        if prev and prev[0] == text and now - prev[1] < 10 and self.lines:
+            n = prev[2] + 1
+            self.lines[-1] = f"\x1b[90m{stamp}\x1b[0m {tag} {colour}{text}\x1b[0m \x1b[90m(x{n})\x1b[0m"
+            self.last_say[side] = (text, now, n)
+            return
+        self.lines.append(f"\x1b[90m{stamp}\x1b[0m {tag} {colour}{text}\x1b[0m")
+        self.last_say[side] = (text, now, 1)
+
+    # ------------------------------------------------------------- snapshots
+    def poll(self):
+        now = time.time()
+        for side in self.sides:
+            st = read_status(side)
+            if st:
+                self.hist[side].append((now, st))
+            if self.last_summary[side] is None:
+                self.last_summary[side] = (now, st)
+            elif now - self.last_summary[side][0] >= SUMMARY:
+                old = self.last_summary[side][1]
+                if old and st:
+                    (self.summary_vessel if side == "V" else self.summary_shore)(old, st)
+                self.last_summary[side] = (now, st)
+
+    def window(self, side):
+        """(oldest snapshot within the rate window, newest, seconds between them)."""
+        h = self.hist[side]
+        if len(h) < 2:
+            return None, None, 0
+        now = h[-1][0]
+        old = next((x for x in h if now - x[0] <= RATE_WINDOW + 0.3), h[0])
+        return old[1], h[-1][1], h[-1][0] - old[0]
+
+    def summary_vessel(self, a, b):
+        rtt = b.get("rtt_us", 0) / 1000
+        for key, name, colour in (("live", "LIVE", "\x1b[32m"), ("replay", "REPLAY", "\x1b[34m")):
+            x, y = a.get(key, {}), b.get(key, {})
+            d = {k: y.get(k, 0) - x.get(k, 0) for k in y}
+            if not any(d.values()):
+                continue
+            parts = []
+            if d.get("packed"):
+                parts.append(f"packed {d['packed']}")
+            if d.get("sent"):
+                lo, hi = y.get("last_seq", 0) - d["sent"] + 1, y.get("last_seq", 0)
+                rng = f" #{lo}-#{hi}" if d["sent"] > 1 else f" #{hi}"
+                parts.append(f"sent {d['sent']}{rng} ({mb(d.get('sent_bytes'))})")
+            if d.get("acked"):
+                parts.append(f"{d['acked']} ACKed" + (f", RTT {rtt:.0f} ms" if rtt else ""))
+            if d.get("resent_timeout"):
+                parts.append(f"\x1b[33mresent {d['resent_timeout']} (ACK timeout)\x1b[0m")
+            if d.get("resent_reconnect"):
+                parts.append(f"\x1b[33mresent {d['resent_reconnect']} (unACKed at reconnect)\x1b[0m")
+            self.say("V", f"{name:<6} " + " · ".join(parts), colour)
+        dropped = b.get("dropped_blocks", 0) - a.get("dropped_blocks", 0)
+        if dropped > 0:
+            self.say("V", f"RAM full, dropped {dropped} blocks", "\x1b[31;1m")
+
+    def summary_shore(self, a, b):
+        before = {v["id"]: v for v in a.get("vessels", [])}
+        many = len(b.get("vessels", [])) > 1
+        for v in b.get("vessels", []):
+            o = before.get(v["id"], {})
+            dl = v.get("live_chunks", 0) - o.get("live_chunks", 0)
+            dr = v.get("replay_chunks", 0) - o.get("replay_chunks", 0)
+            if dl <= 0 and dr <= 0:
+                continue
+            dd = v.get("duplicates", 0) - o.get("duplicates", 0)
+            db = v.get("bytes", 0) - o.get("bytes", 0)
+            lead = f"{v['id']}: " if many else ""
+            parts = [f"LIVE {dl}" if dl else "", f"REPLAY {dr}" if dr else ""]
+            text = f"{lead}stored " + ", ".join(p for p in parts if p) + f" chunks ({mb(db)}) · {dl + dr} ACKs sent"
+            if dd:
+                text += f" · \x1b[33m{dd} duplicate(s)\x1b[0m"
+            self.say("S", text, "\x1b[32m")
+
+    # ---------------------------------------------------------------- events
+    def event(self, side, p):
+        lvl, msg, f = p
+        V = side == "V"
+        say = lambda t, c="": self.say(side, t, c)
+        if V:
+            if msg == "vessel session id":
+                say(f"started, session {f.get('session_id')}")
+            elif msg.startswith("connected to shore"):
+                say("streaming", "\x1b[32;1m")
+            elif msg.startswith("connect failed") or msg.startswith("connect timed out"):
+                say("shore unreachable, retrying", "\x1b[31m")
+            elif msg.startswith("handshake failed"):
+                say(f"handshake failed: {f.get('error', '')}", "\x1b[31m")
+            elif msg.startswith("link down"):
+                say("LINK DOWN (15 s without ACK or keepalive)", "\x1b[31;1m")
+            elif msg.startswith("shore closed connection"):
+                say("shore closed the connection, reconnecting", "\x1b[33m")
+            elif msg == "sealing a segment":
+                why = "RAM >=95%" if f.get("reason") == "high watermark" else "link down"
+                say(f"{why}, sealing {mb(f.get('bytes'))} to disk", "\x1b[33m")
+            elif msg.startswith("segment encrypted"):
+                say(f"AES-256-GCM {mb(f.get('bytes'))} in {f.get('aes_ms')} ms, DEK {f.get('dek')} wrapped, "
+                    f"KEK {f.get('kek')}, ephemeral key {f.get('eph')}...")
+            elif msg == "segment written":
+                say(f"segment #{f.get('segment')} written, {mb(f.get('bytes'))}", "\x1b[33m")
+            elif msg == "replaying segment":
+                say(f"replay {f.get('segment')}")
+            elif msg.startswith("segment decrypted"):
+                say(f"TPM unwrap, KEK {f.get('kek')}, {f.get('tpm_ms')} ms, DEK {f.get('dek')} unwrapped, "
+                    f"verified {mb(f.get('bytes'))}", "\x1b[32m")
+            elif msg == "segment queued on REPLAY":
+                say(f"{mb(f.get('bytes'))} queued on REPLAY")
+            elif "fully ACKed and deleted" in msg:
+                say(f"{os.path.basename(f.get('segment', ''))} ACKed, deleted", "\x1b[32m")
+            elif "replay of segment failed" in msg:
+                m = re.search(r"attempt=(\d+) error=.*?: (?:failed to decrypt/verify: )?(.*)$", msg)
+                say(f"segment rejected ({m.group(1)}/3): {m.group(2)}" if m else "segment rejected", "\x1b[31;1m")
+            elif "set aside" in msg:
+                say("segment set aside as .corrupt", "\x1b[31;1m")
+            elif "spill disk has no room" in msg:
+                say("spill disk full, spill paused", "\x1b[31;1m")
+            elif "TPM KEKs ready" in msg:
+                say(f"TPM ready, KEK {f.get('current')}, {f.get('resident')} resident")
+            elif "supervising dumpcap" in msg:
+                say("dumpcap started")
+            elif "ring buffer full" in msg:
+                pass   # the per-second summary reports drops
+            elif lvl in ("WARN", "ERROR"):
+                say(f"{lvl}: {msg} " + " ".join(f"{k}={v}" for k, v in f.items()), "\x1b[31m")
+            elif self.verbose:
+                say(msg + (" " + " ".join(f"{k}={v}" for k, v in f.items()) if f else ""))
+        else:
+            if msg == "vessel authenticated":
+                say(f"authenticated {f.get('vessel')}, session {f.get('session_id')}", "\x1b[32m")
+            elif msg.startswith("reconnect: same session"):
+                say(f"{f.get('vessel')}: reconnect, same session")
+            elif msg == "new session":
+                say(f"{f.get('vessel')}: new session" + (", previous one closed" if f.get("supersedes") == "true" else ""))
+            elif msg == "flushed stream to Malcolm ingest":
+                say(f"{f.get('vessel')}: published {os.path.basename(f.get('ingest', ''))} ({mb(f.get('bytes'))})", "\x1b[35m")
+            elif msg == "vessel connection closed":
+                say(f"{f.get('vessel')}: disconnected", "\x1b[33m")
+            elif "vessel connection ended with error" in msg:
+                say(f"connection from {f.get('peer', '?').split(':')[0]} refused: {f.get('error', '')}", "\x1b[31m")
+            elif lvl in ("WARN", "ERROR"):
+                say(f"{lvl}: {msg} " + " ".join(f"{k}={v}" for k, v in f.items()), "\x1b[31m")
+            elif self.verbose:
+                say(msg + (" " + " ".join(f"{k}={v}" for k, v in f.items()) if f else ""))
+
+    # ---------------------------------------------------------------- screen
+    def panel_vessel(self, out):
+        h = self.hist["V"]
+        if not h:
+            out.append(f" \x1b[36mVESSEL\x1b[0m  \x1b[1m{HOST}\x1b[0m  waiting for {STATUS['V']} (is noc-vessel running?)")
+            return
+        s = h[-1][1]
+        a, b, dt = self.window("V")
+        link = s.get("link", "?")
+        colour = {"streaming": "\x1b[32;1m", "down": "\x1b[31;1m"}.get(link, "\x1b[33;1m")
+        since = ""
+        if link != "streaming" and s.get("link_since_ms"):
+            since = f" for {max(0, time.time() - s['link_since_ms'] / 1000):.0f} s"
+        out.append(f" \x1b[36mVESSEL\x1b[0m  \x1b[1m{HOST}\x1b[0m  link {colour}{(link.upper() + since):<20}\x1b[0m"
+                   f" shore {s.get('shore', ''):<22} session {s.get('session', '')}")
+        if dt > 0.5:
+            d = lambda k: b.get(k, 0) - a.get(k, 0)
+            ds = lambda k: sum(b.get(x, {}).get(k, 0) - a.get(x, {}).get(k, 0) for x in ("live", "replay"))
+            cap = (f"{d('cap_bytes') * 8 / dt / 1e6:6.2f} Mbps  "
+                   f"({d('cap_packets') / dt:,.0f} packets/s on {', '.join(s.get('interfaces', []))})")
+            sent, sbytes = ds("sent") / dt, ds("sent_bytes") / dt
+        else:
+            cap, sent, sbytes = "   -", 0.0, 0.0
+        out.append(f"   capturing   {cap}")
+        n, mx = s.get("inflight", 0), s.get("max_inflight", 0) or 8
+        rtt = f"{s['rtt_us'] / 1000:.0f} ms" if s.get("rtt_us") else "-"
+        out.append(f"   in flight   [{'■' * n}{'□' * max(0, mx - n)}] {n}/{mx}   round trip {rtt:<8}  "
+                   f"sending {sent:4.1f} chunks/s  ({sbytes * 8 / 1e6:.2f} Mbps)")
+        lc, lu, lp = s.get("live_cap") or 1, s.get("live_used", 0), s.get("live_pending", 0)
+        out.append(f"   live RAM    {bar(lu / lc)} {100 * lu / lc:5.1f}%  {mb(lu)} of {mb(lc)} "
+                   f"({mb(lp)} waiting to send, {mb(lu - lp)} sent and awaiting ACK)")
+        rc, ru = s.get("replay_cap") or 1, s.get("replay_used", 0)
+        rep = f"   replaying {s['replaying']}" if s.get("replaying") else ""
+        out.append(f"   replay RAM  {bar(ru / rc)} {100 * ru / rc:5.1f}%  {mb(ru)} of {mb(rc)}{rep}")
+        out.append(f"   FIFO        {bar(s.get('fifo', 0) / 16777216)} {mb(s.get('fifo'))} of 16.8 MB")
+        drops = f"   \x1b[31mdropped {s['dropped_blocks']:,} blocks\x1b[0m" if s.get("dropped_blocks") else ""
+        out.append(f"   spill disk  {s.get('segments', 0)} encrypted segment(s), {mb(s.get('segment_bytes'))}"
+                   f"     current KEK {s.get('kek', '-')}{drops}")
+
+    def panel_shore(self, out):
+        h = self.hist["S"]
+        if not h:
+            out.append(f" \x1b[35mSHORE \x1b[0m  \x1b[1m{HOST}\x1b[0m  waiting for {STATUS['S']} (is noc-shore running?)")
+            return
+        s = h[-1][1]
+        vessels = s.get("vessels", [])
+        if not vessels:
+            out.append(" \x1b[35mSHORE \x1b[0m  no vessel has connected since this shore started")
+        a, b, dt = self.window("S")
+        before = {v["id"]: v for v in (a or {}).get("vessels", [])}
+        for i, v in enumerate(vessels):
+            tag = " \x1b[35mSHORE \x1b[0m " if i == 0 else "        "
+            chunks = v.get("live_chunks", 0) + v.get("replay_chunks", 0)
+            ago = time.time() - v["last_chunk_ms"] / 1000 if v.get("last_chunk_ms") else None
+            if dt > 0.5 and v["id"] in before and ago is not None and ago < 5:
+                state = f"receiving {(v.get('bytes', 0) - before[v['id']].get('bytes', 0)) * 8 / dt / 1e6:.2f} Mbps"
+            elif ago is not None:
+                state = f"quiet {ago:.0f} s"
+            else:
+                state = ""
+            conn = "\x1b[32mconnected\x1b[0m" if v.get("connections") else "\x1b[90mnot connected\x1b[0m"
+            out.append(f"{tag} vessel {v['id']:<14} {conn:<22} chunks received {chunks:,} (duplicates {v.get('duplicates', 0):,})   "
+                       f"ACKs sent {chunks:,}   files for Malcolm {v.get('files', 0)}   {state}")
+
+    def render(self):
+        cols, rows = shutil.get_terminal_size((120, 40))
+        out = [f"\x1b[1m NOC console\x1b[0m   \x1b[1;33m{HOST}\x1b[0m   vessel → shore pipeline   "
+               f"{datetime.datetime.now():%H:%M:%S}", "─" * min(cols, 110)]
+        if "V" in self.sides:
+            self.panel_vessel(out)
+        if "S" in self.sides:
+            self.panel_shore(out)
+        out.append("─" * min(cols, 110))
+        out = [fit(l, cols) for l in out]
+        room = max(3, rows - len(out))
+        body = []
+        for l in list(self.lines)[-room:]:
+            body.extend(wrap(l, cols))
+        out = (out + body[-room:])[:rows]
+        if self.stream_out:
+            sys.stdout.write("\n".join(out) + "\n"); sys.stdout.flush()
+            return
+        # Rewrite only the lines that changed since the last frame, each in place, and frame
+        # it in synchronized-output marks so the terminal shows it whole (others ignore them).
+        if (cols, rows) != self.prev_size:
+            self.prev_frame, self.prev_size = [], (cols, rows)
+        buf = ["\x1b[?2026h"]
+        for i, line in enumerate(out):
+            if i >= len(self.prev_frame) or self.prev_frame[i] != line:
+                buf.append(f"\x1b[{i + 1};1H{line}\x1b[K")
+        if len(out) < len(self.prev_frame) or not self.prev_frame:
+            buf.append(f"\x1b[{len(out) + 1};1H\x1b[J")
+        buf.append("\x1b[?2026l")
+        self.prev_frame = out
+        if len(buf) > 2:
+            sys.stdout.write("".join(buf)); sys.stdout.flush()
+
+def follow(unit, side, q):
+    """Follow a unit's journal from now on, restarting journalctl if it ends."""
+    while True:
+        p = subprocess.Popen(["journalctl", "-u", unit, "-f", "-n", "0", "-o", "cat"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        for line in p.stdout:
+            q.put((side, line))
+        time.sleep(2)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--verbose", action="store_true", help="also show every other daemon log line")
+    a = ap.parse_args()
+    def installed(unit):
+        return subprocess.run(["systemctl", "cat", unit], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+    sides = tuple(s for s in ("V", "S") if installed(UNIT[s]))
+    if not sides:
+        sys.exit("neither noc-vessel nor noc-shore is installed on this machine")
+    if os.geteuid() != 0:
+        sys.exit("run as root: sudo noc-console")
+    c = Console(a.verbose, sides)
+    q = queue.Queue()
+    for s in sides:
+        threading.Thread(target=follow, args=(UNIT[s], s, q), daemon=True).start()
+    def leave(*_):
+        if sys.stdout.isatty():
+            sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")   # cursor and main screen back
+        sys.stdout.flush()
+        os._exit(0)
+    signal.signal(signal.SIGINT, leave)
+    signal.signal(signal.SIGTERM, leave)
+    if sys.stdout.isatty():
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")       # alternate screen, cursor hidden
+    c.say(sides[0], "following " + " and ".join(UNIT[s] for s in sides))
+    while True:
+        t0 = time.time()
+        try:
+            while True:
+                side, line = q.get_nowait()
+                p = parse(line)
+                if p:
+                    c.event(side, p)
+        except queue.Empty:
+            pass
+        c.poll()
+        c.render()
+        time.sleep(max(0.0, FRAME - (time.time() - t0)))
+
+if __name__ == "__main__":
+    main()

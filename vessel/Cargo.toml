@@ -1,0 +1,32 @@
+[package]
+name = "noc-vessel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "noc_vessel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "noc-vessel"
+path = "src/main.rs"
+
+[dependencies]
+noc-common = { path = "../common" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+base64 = "0.22"
+libc = "0.2"
+# TPM-rooted KEKs for at-rest segment encryption. Needs the TSS 2.0
+# runtime libraries on the vessel, and libtss2-dev + pkg-config to build.
+tss-esapi = "7.7"
+# Software half of the at-rest key exchange: the ephemeral ECDH that wraps a
+# segment's data key against the TPM-held KEK's public point, and the hash KDF over it.
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"

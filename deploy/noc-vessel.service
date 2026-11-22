@@ -1,0 +1,57 @@
+# NOC vessel daemon
+# Hardened systemd service unit for the NOC vessel daemon.
+# Captures network packets from harbour craft interfaces and securely transmits them to shore.
+# Note: systemd does not allow inline comments on directive lines, so every comment is on its own line.
+
+[Unit]
+Description=NOC vessel daemon (harbour-craft capture -> shore transport)
+Documentation=file:///etc/noc/vessel.toml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=noc-vessel
+Group=noc-vessel
+
+# Adds group 'tss' so the daemon can access the hardware TPM (/dev/tpmrm0) to manage encryption keys.
+SupplementaryGroups=tss
+
+# Extracts the private signing key from the root-owned WARP registration before starting.
+# The '+' prefix runs this pre-start step as root to read reg.json, while daemon runs unprivileged.
+ExecStartPre=+/usr/local/bin/noc-stage-warp-key
+ExecStart=/usr/local/bin/noc-vessel
+
+# Automatically restart the daemon after 2 seconds if it stops unexpectedly.
+Restart=always
+RestartSec=2
+
+# Sets up isolated directories with private 0700 permissions:
+# - /run/noc-vessel: holds the packet capture pipe (FIFO)
+# - /var/lib/noc-vessel: holds encrypted spill segment files when disconnected from shore
+RuntimeDirectory=noc-vessel
+RuntimeDirectoryMode=0700
+StateDirectory=noc-vessel
+StateDirectoryMode=0700
+
+# Privilege settings: dumpcap needs network capture file capabilities, which require
+# NoNewPrivileges=no to take effect when dumpcap is executed by the unprivileged daemon.
+# The bounding set restricts privileges strictly to raw packet capture and interface administration.
+NoNewPrivileges=no
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=
+
+# Filesystem and process sandboxing directives that do not implicitly enable NoNewPrivileges.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ReadWritePaths=/run/noc-vessel /var/lib/noc-vessel
+
+# Disables core dumps so encryption keys in memory are never written to disk during a crash.
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
